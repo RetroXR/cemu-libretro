@@ -2427,10 +2427,7 @@ static void libretro_nfc_attach()
 	s_nfc_last = RETRO_NFC_STATUS_UNSUPPORTED;
 	if (!environ_cb)
 		return;
-	// At 113, not the PR's 99: upstream has since given 99 to
-	// GET_VIDEO_DECODE_INTERFACE (NfcInterface.h). A RetroArch built from the
-	// PR as it stands answers 99, so it does not reach this core until the PR
-	// is renumbered.
+	// 113, not the PR's 99 (upstream's GET_VIDEO_DECODE_INTERFACE).
 	s_nfc.version = RETRO_NFC_INTERFACE_VERSION;
 	const bool got = environ_cb(RETRO_ENVIRONMENT_GET_NFC_INTERFACE, &s_nfc);
 	// Version 1 is all this needs: scan, status, tag info, read and write.
