@@ -13,7 +13,10 @@
 #include <cstdarg>
 #include "libretro.h"
 #include "SensorIndex.h"
+#include "VideoViews.h"
+#include "LibretroDRC.h"
 #include "NfcInterface.h"
+#include "ControllerAudioInterface.h"
 
 #include "config/CemuConfig.h"
 #include "Cafe/Account/Account.h"
@@ -956,7 +959,10 @@ static void libretro_report_out_size()
 	geometry.base_height = height;
 	geometry.max_width = s_max_out_width;
 	geometry.max_height = s_max_out_height;
-	geometry.aspect_ratio = 16.0f / 9.0f;
+	// A Views frame is two pictures side by side: its shape is its pixels'
+	// (each view carries its own 16:9).
+	geometry.aspect_ratio = g_libretroScreenLayout == LibretroScreenLayout::Views && height
+		? (float)width / (float)height : 16.0f / 9.0f;
 	environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 	libretro_log(RETRO_LOG_INFO, "output is now %ux%u\n", width, height);
 }
@@ -983,6 +989,8 @@ void libretro_gl_picture_size(int width, int height, bool padView)
 		w = width;
 		h = height;
 	}
+	if (!padView && g_libretroScreenLayout == LibretroScreenLayout::Views)
+		w = (int)LibretroDRC_ViewsFrameWidth((uint32)w);
 	auto& windowInfo = WindowSystem::GetWindowInfo();
 	if (windowInfo.phys_width == w && windowInfo.phys_height == h)
 		return;
@@ -1411,6 +1419,7 @@ static const char* libretro_screen_layout_name(LibretroScreenLayout layout)
 	case LibretroScreenLayout::SideBySide: return "Side by Side";
 	case LibretroScreenLayout::TopBottom: return "Top Bottom";
 	case LibretroScreenLayout::PictureInPicture: return "Picture in Picture";
+	case LibretroScreenLayout::Views: return "Views";
 	}
 	return "Default Screen";
 }
@@ -1432,9 +1441,24 @@ bool LibretroDRC_ShouldRenderScreen(bool padView)
 	case LibretroScreenLayout::SideBySide:
 	case LibretroScreenLayout::TopBottom:
 	case LibretroScreenLayout::PictureInPicture:
+	case LibretroScreenLayout::Views:
 		return true;
 	}
 	return !padView;
+}
+
+uint32 LibretroDRC_ViewsFrameWidth(uint32 tvWidth)
+{
+	return tvWidth + (tvWidth * 2 + 1) / 3;
+}
+
+int LibretroDRC_ViewsTvWidth(int frameWidth)
+{
+	const int guess = frameWidth * 3 / 5;
+	for (int w = guess - 2; w <= guess + 2; ++w)
+		if (w > 0 && (int)LibretroDRC_ViewsFrameWidth((uint32)w) == frameWidth)
+			return w;
+	return guess;
 }
 
 bool LibretroDRC_OutputFollowsScreen(bool padView)
@@ -1506,6 +1530,28 @@ void LibretroDRC_ComputeViewport(bool padView,
 			outHeight = (dstHeight * 30) / 100;
 		}
 		return;
+
+	case LibretroScreenLayout::Views:
+	{
+		// The TV is always screen 0 here: GamePad Position swaps a composite,
+		// and the frontend places each view itself.
+		const int tvWidth = LibretroDRC_ViewsTvWidth(dstWidth);
+		if (!padView)
+		{
+			outX = 0;
+			outY = 0;
+			outWidth = tvWidth;
+			outHeight = dstHeight;
+		}
+		else
+		{
+			outX = tvWidth;
+			outY = 0;
+			outWidth = dstWidth - tvWidth;
+			outHeight = (dstHeight * 2 + 1) / 3;
+		}
+		return;
+	}
 
 	case LibretroScreenLayout::PictureInPicture:
 		if (isPrimary)
@@ -3082,9 +3128,14 @@ static LibretroLayoutButton libretro_parse_layout_button(const char* v)
 	return LibretroLayoutButton::None;
 }
 
+// Set while the frontend presents video views (RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS):
+// the Views layout then stands in for the user's, which comes back without them.
+static bool s_video_views_active = false;
+static bool s_video_views_sent = false;
+
 static void libretro_apply_screen_layout()
 {
-	const LibretroScreenLayout layout = s_screen_layouts[s_screen_layout_index];
+	const LibretroScreenLayout layout = s_video_views_active ? LibretroScreenLayout::Views : s_screen_layouts[s_screen_layout_index];
 	if (layout == g_libretroScreenLayout)
 		return;
 
@@ -4783,8 +4834,17 @@ static void libretro_update_output_fps(bool steady = false)
 	}
 	s_pending_fps = 0.0;
 	s_output_fps = wanted;
+	// The size the frontend was last told, not the current one: a new size goes
+	// over as SET_GEOMETRY (libretro_report_out_size), and a new base size here
+	// makes a frontend rebuild the graphics context, which is the close.
+	const uint32_t told_w = s_reported_out_width, told_h = s_reported_out_height;
 	retro_system_av_info av{};
 	retro_get_system_av_info(&av);
+	if (told_w && told_h)
+	{
+		av.geometry.base_width = s_reported_out_width = told_w;
+		av.geometry.base_height = s_reported_out_height = told_h;
+	}
 	environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
 	libretro_log(RETRO_LOG_INFO, "frame rate: %g\n", s_output_fps);
 }
@@ -4807,6 +4867,8 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 	if (s_port_device[port] == device)
 		return;
 	s_port_device[port] = device;
+	if (port == 0)
+		LibretroAudioAPI::SetGamePadPresent(libretro_gamepad_on_port1());
 
 	// Before a title is loaded this is just recorded: libretro_setup_controllers
 	// runs as part of the launch and will read it then. Changing a port while a
@@ -7012,6 +7074,20 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game)
 	if (!s_install_content)
 		libretro_nfc_attach();
 
+	// The GamePad's speaker on its own, for a frontend that can play it from
+	// the GamePad (ControllerAudioInterface.h); otherwise it is mixed into the TV.
+	{
+		static retro_controller_audio_interface s_controller_audio{};
+		s_controller_audio = {};
+		const bool got = !s_install_content && environ_cb &&
+			environ_cb(RETRO_ENVIRONMENT_GET_CONTROLLER_AUDIO_INTERFACE, &s_controller_audio) &&
+			s_controller_audio.interface_version >= RETRO_CONTROLLER_AUDIO_INTERFACE_VERSION && s_controller_audio.push;
+		LibretroAudioAPI::SetGamePadAudio(got ? s_controller_audio.push : nullptr, got ? s_controller_audio.frontend_data : nullptr);
+		LibretroAudioAPI::SetGamePadPresent(libretro_gamepad_on_port1());
+		libretro_log(RETRO_LOG_WARN, "GamePad speaker: %s\n", got
+			? "played from the GamePad (controller audio interface)" : "mixed into the TV");
+	}
+
 	// Vulkan: context_reset is called by RetroArch after RETRO_HW_CONTEXT_VULKAN is set up
 
 	return true;
@@ -7103,6 +7179,7 @@ static void libretro_stop_system_services()
 RETRO_API void retro_unload_game()
 {
 	libretro_nfc_detach();
+	LibretroAudioAPI::SetGamePadAudio(nullptr, nullptr);
 	libretro_set_motion(false);
 	// Every remote's sensors off; the ports' devices stay as the frontend set them.
 	{
@@ -8252,6 +8329,70 @@ static void libretro_finish_run(std::chrono::steady_clock::time_point start,
 	}
 }
 
+// Video views: with a frontend that presents them, the TV and the GamePad are
+// packed beside each other (the Views layout) and the frontend is told where
+// each is; without one the user's layouts apply. Asked every frame, as the
+// answer may change.
+static void libretro_update_video_views_layout()
+{
+	unsigned status = 0;
+	const bool presents = environ_cb && environ_cb(RETRO_ENVIRONMENT_GET_VIDEO_VIEWS_STATUS, &status) &&
+		(status & RETRO_VIDEO_VIEWS_STATUS_PRESENTS);
+	if (presents == s_video_views_active)
+		return;
+	s_video_views_active = presents;
+	libretro_log(RETRO_LOG_WARN, "video views %s: %s\n", presents ? "presented" : "not presented",
+		presents ? "TV and GamePad packed side by side" : "back to the screen layout option");
+	libretro_apply_screen_layout();
+}
+
+// Before each video_cb: the map for the frame about to be handed over, or a
+// cleared map once views are no longer used.
+static void libretro_send_video_views(uint32_t frameWidth, uint32_t frameHeight)
+{
+	if (!environ_cb)
+		return;
+	if (!s_video_views_active || g_libretroScreenLayout != LibretroScreenLayout::Views)
+	{
+		if (s_video_views_sent)
+		{
+			retro_video_views none{};
+			environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &none);
+			s_video_views_sent = false;
+		}
+		return;
+	}
+	retro_video_view views[2]{};
+	for (int i = 0; i < 2; ++i)
+	{
+		int x, y, w, h;
+		LibretroDRC_ComputeViewport(i == 1, (int)frameWidth, (int)frameHeight, x, y, w, h);
+		if (w <= 0 || h <= 0)
+			return;
+		views[i].x = (unsigned)x;
+		views[i].y = (unsigned)y;
+		views[i].width = (unsigned)w;
+		views[i].height = (unsigned)h;
+		views[i].screen = (unsigned)i; // 0 the TV, 1 the GamePad
+		views[i].eye = RETRO_VIDEO_VIEW_EYE_NONE;
+		views[i].aspect_ratio = 16.0f / 9.0f;
+	}
+	retro_video_views map{};
+	map.views = views;
+	map.num_views = 2;
+	static uint32_t s_logged_w = 0, s_logged_h = 0;
+	const bool ok = environ_cb(RETRO_ENVIRONMENT_SET_VIDEO_VIEWS, &map);
+	s_video_views_sent = ok;
+	if (frameWidth != s_logged_w || frameHeight != s_logged_h)
+	{
+		s_logged_w = frameWidth;
+		s_logged_h = frameHeight;
+		libretro_log(RETRO_LOG_WARN, "video views in a %ux%u frame: TV %u,%u %ux%u, GamePad %u,%u %ux%u (%s)\n",
+			frameWidth, frameHeight, views[0].x, views[0].y, views[0].width, views[0].height,
+			views[1].x, views[1].y, views[1].width, views[1].height, ok ? "accepted" : "refused");
+	}
+}
+
 RETRO_API void retro_run()
 {
 	if (s_ppc_process_exited.exchange(false, std::memory_order_acq_rel) && environ_cb)
@@ -8265,6 +8406,8 @@ RETRO_API void retro_run()
 		s_audio_submission_allowed = false;
 		environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, nullptr);
 	}
+
+	libretro_update_video_views_layout();
 
 	if (s_convert_mode.load())
 	{
@@ -8593,6 +8736,7 @@ RETRO_API void retro_run()
 			}
 		}
 		libretro_report_out_size();
+		libretro_send_video_views(libretro_out_width(), libretro_out_height());
 		video_cb(RETRO_HW_FRAME_BUFFER_VALID, libretro_out_width(), libretro_out_height(), 0);
 		libretro_finish_run(profStart, profWaited, profTimedOut);
 		return;
@@ -8692,6 +8836,7 @@ RETRO_API void retro_run()
 #endif // ENABLE_OPENGL
 
 	libretro_report_out_size();
+	libretro_send_video_views(libretro_out_width(), libretro_out_height());
 	video_cb(RETRO_HW_FRAME_BUFFER_VALID, libretro_out_width(), libretro_out_height(), 0);
 	// Flush audio
 	libretro_finish_run(profStart, profWaited, profTimedOut);

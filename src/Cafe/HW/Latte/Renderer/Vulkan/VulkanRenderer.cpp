@@ -1154,7 +1154,13 @@ void VulkanRenderer::UpdatePresentationImageSize(uint32 width, uint32 height, bo
 		return;
 	if (!padView && !LatteTexture_graphicPackSetsResolution())
 		LibretroDRC_DefaultOutputSize(width, height);
-	if (width < 16 || height < 16 || width > maxWidth || height > maxHeight)
+	uint32 widest = maxWidth;
+	if (!padView && g_libretroScreenLayout == LibretroScreenLayout::Views)
+	{
+		width = LibretroDRC_ViewsFrameWidth(width);
+		widest = LibretroDRC_ViewsFrameWidth(maxWidth);
+	}
+	if (width < 16 || height < 16 || width > widest || height > maxHeight)
 		return;
 	if (width == m_presentWidth && height == m_presentHeight)
 		return;

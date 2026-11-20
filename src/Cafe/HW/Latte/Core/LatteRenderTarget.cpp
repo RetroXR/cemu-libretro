@@ -1052,7 +1052,8 @@ void LatteRenderTarget_itHLECopyColorBufferToScanBuffer(MPTR colorBufferPtr, uin
 	const bool libretroComposite =
 		g_libretroScreenLayout == LibretroScreenLayout::SideBySide ||
 		g_libretroScreenLayout == LibretroScreenLayout::TopBottom ||
-		g_libretroScreenLayout == LibretroScreenLayout::PictureInPicture;
+		g_libretroScreenLayout == LibretroScreenLayout::PictureInPicture ||
+		g_libretroScreenLayout == LibretroScreenLayout::Views;
 	// The GamePad-only layout has the same ordering problem, for a different
 	// reason: the mirror at the end of this function copies the TV image into
 	// the pad view for titles that never draw a DRC image of their own, and a

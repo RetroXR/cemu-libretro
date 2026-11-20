@@ -14,7 +14,15 @@ enum class LibretroScreenLayout
 	SideBySide,       // primary 80% + secondary 20%, side-by-side
 	TopBottom,        // primary 70% on top, secondary 30% on bottom
 	PictureInPicture, // primary fullscreen, secondary as small corner overlay
+	Views,            // TV beside the GamePad, each at full size, for a frontend
+	                  // that lays out RETRO_ENVIRONMENT_SET_VIDEO_VIEWS itself
 };
+
+// The Views layout's frame: the TV picture (tvWidth x height) with the GamePad
+// beside it at two thirds of the TV's size (854x480 beside 1280x720).
+uint32 LibretroDRC_ViewsFrameWidth(uint32 tvWidth);
+// The TV picture's width in a Views frame of this width.
+int LibretroDRC_ViewsTvWidth(int frameWidth);
 
 extern LibretroScreenLayout g_libretroScreenLayout;
 extern bool g_libretroDRCPositionSwapped;

@@ -25,6 +25,11 @@ uint64_t LibretroAudioAPI::s_stat_sent = 0;
 uint64_t LibretroAudioAPI::s_stat_flushes = 0;
 uint64_t LibretroAudioAPI::s_stat_empty_flushes = 0;
 LibretroAudioRingBuffer LibretroAudioAPI::s_ring_buffer;
+std::atomic<LibretroAudioAPI::ControllerAudioPush> LibretroAudioAPI::s_gamepad_push{nullptr};
+void* LibretroAudioAPI::s_gamepad_frontend_data = nullptr;
+std::atomic_bool LibretroAudioAPI::s_gamepad_present{true};
+LibretroAudioRingBuffer LibretroAudioAPI::s_gamepad_ring;
+std::vector<int16_t> LibretroAudioAPI::s_gamepad_buffer;
 std::atomic_bool LibretroAudioAPI::s_thread_mode{false};
 LibretroAudioAPI::MultiAudioCallback LibretroAudioAPI::s_multi_callback = nullptr;
 unsigned LibretroAudioAPI::s_out_channels = 2;
@@ -163,6 +168,7 @@ void LibretroAudioAPI::FlushAudio(size_t frames)
 		return;
 
 	const size_t framesRead = samplesRead / channels;
+	PushGamePad(framesRead);
 
 	// retro_audio_sample_batch_t may consume fewer frames than offered; loop so
 	// a partial accept doesn't lose audio.
@@ -207,6 +213,7 @@ size_t LibretroAudioAPI::PullAudio(size_t maxFrames)
 	const size_t wanted = std::min<size_t>(maxFrames, 1024) * channels;
 	const size_t samplesRead = s_ring_buffer.Read(s_pull_buffer.data(), wanted);
 	const size_t framesRead = samplesRead / channels;
+	PushGamePad(framesRead);
 
 	size_t framesSent = 0;
 	const int16_t* cursor = s_pull_buffer.data();
@@ -229,6 +236,59 @@ size_t LibretroAudioAPI::PullAudio(size_t maxFrames)
 void LibretroAudioAPI::DropBuffered()
 {
 	s_ring_buffer.Discard(s_ring_buffer.GetReadAvailableSamples());
+	s_gamepad_ring.Discard(s_gamepad_ring.GetReadAvailableSamples());
+}
+
+void LibretroAudioAPI::SetGamePadAudio(ControllerAudioPush push, void* frontend_data)
+{
+	s_gamepad_frontend_data = frontend_data;
+	s_gamepad_push.store(push, std::memory_order_release);
+	s_gamepad_ring.Reset();
+}
+
+void LibretroAudioAPI::SetGamePadPresent(bool present)
+{
+	s_gamepad_present.store(present, std::memory_order_relaxed);
+}
+
+bool LibretroAudioAPI::GamePadAudioSeparate()
+{
+	return s_gamepad_push.load(std::memory_order_acquire) && s_gamepad_present.load(std::memory_order_relaxed);
+}
+
+void LibretroAudioAPI::FeedGamePadBlock(const int16_t* data, size_t frames)
+{
+	if (data && frames)
+		s_gamepad_ring.Write(data, frames * 2);
+}
+
+void LibretroAudioAPI::PushGamePad(size_t frames)
+{
+	const ControllerAudioPush push = s_gamepad_push.load(std::memory_order_acquire);
+	if (!push || frames == 0)
+		return;
+	if (!s_gamepad_present.load(std::memory_order_relaxed))
+	{
+		s_gamepad_ring.Discard(s_gamepad_ring.GetReadAvailableSamples());
+		return;
+	}
+	// As many frames as the main batch, silence where the GamePad made none, so
+	// the frontend can keep the two in step. Anything the GamePad got ahead by
+	// past two batches is dropped.
+	const size_t samples = frames * 2;
+	if (s_gamepad_buffer.size() < samples)
+		s_gamepad_buffer.resize(samples);
+	const size_t got = s_gamepad_ring.Read(s_gamepad_buffer.data(), samples);
+	std::fill(s_gamepad_buffer.begin() + got, s_gamepad_buffer.begin() + samples, (int16_t)0);
+	const size_t left = s_gamepad_ring.GetReadAvailableSamples();
+	if (left > 2 * samples)
+		s_gamepad_ring.Discard(left - 2 * samples);
+	if (!push(s_gamepad_frontend_data, 0, 0, 0, s_gamepad_buffer.data(), frames))
+	{
+		// Declined: mix into the TV from here on, as without an interface
+		s_gamepad_push.store(nullptr, std::memory_order_release);
+		cemuLog_log(LogType::Force, "[libretro] the frontend declined the GamePad's sound; mixing it into the TV");
+	}
 }
 
 void LibretroAudioAPI::SetStatsLogging(bool enabled)

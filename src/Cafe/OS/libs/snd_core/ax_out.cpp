@@ -360,6 +360,12 @@ namespace snd_core
 		tempDRCAudioBlockCounter++;
 		if (tempDRCAudioBlockCounter == AX_FRAMES_PER_GROUP)
 		{
+			if (LibretroAudioAPI::GamePadAudioSeparate())
+			{
+				// Out of the GamePad, not the TV (ControllerAudioInterface.h)
+				LibretroAudioAPI::FeedGamePadBlock(tempDRCChannelData, (size_t)AX_SAMPLES_PER_3MS_48KHZ * (size_t)AX_FRAMES_PER_GROUP);
+			}
+			else
 			{
 				constexpr size_t kChannels = 2;
 				const size_t samplesToCopy = (size_t)AX_SAMPLES_PER_3MS_48KHZ * (size_t)AX_FRAMES_PER_GROUP * kChannels;
