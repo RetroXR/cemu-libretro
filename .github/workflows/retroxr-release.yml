@@ -1,0 +1,217 @@
+# Build the retroXR Cemu core and publish it as a release, so retroXR's
+# CoreDownloadManager can fetch it.
+#
+#   Windows  cemu_libretro.dll.zip          containing cemu_libretro.dll
+#   Android  cemu_libretro_android.so.zip   containing cemu_libretro_android.so
+#   Linux    cemu_libretro.so.zip           containing cemu_libretro.so
+#   macOS    cemu_libretro_arm64.dylib.zip  containing cemu_libretro.dylib
+#
+# Over the stock core, this fork hands the TV and the GamePad over as two video
+# views (RETRO_ENVIRONMENT_SET_VIDEO_VIEWS) when the frontend presents them, the
+# GamePad's speaker through the controller audio interface, Wii Remote motion,
+# MotionPlus, the Nunchuk's accelerometer and IR camera, and amiibo through the
+# frontend's NFC reader.
+#
+# The configure and build steps are libretro.yml's. Windows must succeed; the
+# other platforms publish what built (Android has never run a game).
+#
+# The release must NOT be a prerelease: retroXR fetches /releases/latest/.
+name: retroXR core release
+
+on:
+  push:
+    tags:
+      - 'retroxr-cemu-libretro-v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build'
+        required: true
+        default: 'retroxr'
+      tag:
+        description: 'Release tag to publish as (leave blank to build without publishing)'
+        required: false
+        default: ''
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.29.0'
+      - name: Bootstrap vcpkg
+        run: ./dependencies/vcpkg/bootstrap-vcpkg.bat
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_LIBRETRO=ON -DENABLE_WXWIDGETS=OFF -DENABLE_DISCORD_RPC=OFF -DENABLE_CUBEB=OFF -DVCPKG_INSTALL_OPTIONS="--clean-after-build"
+      - name: Build
+        run: cmake --build build --target cemu_libretro --config Release
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item bin/cemu_libretro.dll stage/cemu_libretro.dll
+          Compress-Archive -Path stage/cemu_libretro.dll -DestinationPath cemu_libretro.dll.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: cemu_libretro.dll.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - name: Install dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -y --no-install-recommends \
+            cmake ninja-build nasm autoconf automake libtool pkg-config python3 zip \
+            libglm-dev libgl1-mesa-dev libegl1-mesa-dev freeglut3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+            libudev-dev libdbus-1-dev libgcrypt20-dev libpulse-dev \
+            libsecret-1-dev libsystemd-dev libbluetooth-dev
+      - name: Bootstrap vcpkg
+        run: bash ./dependencies/vcpkg/bootstrap-vcpkg.sh
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_LIBRETRO=ON \
+            -DENABLE_WXWIDGETS=OFF -DENABLE_DISCORD_RPC=OFF -DENABLE_CUBEB=OFF \
+            -DENABLE_BLUEZ=OFF -DENABLE_FERAL_GAMEMODE=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      - name: Build
+        run: cmake --build build --target cemu_libretro -- -j $(nproc)
+      - name: Package
+        run: |
+          mkdir -p stage && cp bin/cemu_libretro.so stage/
+          (cd stage && zip -q -X ../cemu_libretro.so.zip cemu_libretro.so)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: cemu_libretro.so.zip
+
+  android:
+    name: Android arm64-v8a
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - name: Install host dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -y --no-install-recommends nasm autoconf automake libtool pkg-config python3 ninja-build zip
+      - name: Bootstrap vcpkg
+        run: bash ./dependencies/vcpkg/bootstrap-vcpkg.sh
+      - name: Configure
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_LIBRETRO=ON -DENABLE_BLUEZ=OFF \
+            -DENABLE_FERAL_GAMEMODE=OFF -DENABLE_WAYLAND=OFF -DENABLE_DISCORD_RPC=OFF \
+            -DVCPKG_TARGET_TRIPLET=arm64-android -DVCPKG_HOST_TRIPLET=x64-linux \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_STL=c++_static -DANDROID_ABI=arm64-v8a . -Bbuild/android
+      - name: Build
+        run: cmake --build build/android --target cemu_libretro --config Release -- -j $(nproc)
+      - name: Package
+        run: |
+          mkdir -p stage && cp bin/cemu_libretro.so stage/cemu_libretro_android.so
+          (cd stage && zip -q -X ../cemu_libretro_android.so.zip cemu_libretro_android.so)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: cemu_libretro_android.so.zip
+
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - name: Install dependencies
+        run: brew install nasm automake libtool
+      - name: Install MoltenVK
+        run: |
+          curl -L -O https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.1/MoltenVK-macos-privateapi.tar
+          tar xf MoltenVK-macos-privateapi.tar
+          sudo mkdir -p /usr/local/lib
+          sudo cp MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib /usr/local/lib
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.29.0'
+      - name: Bootstrap vcpkg
+        run: bash ./dependencies/vcpkg/bootstrap-vcpkg.sh
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DENABLE_LIBRETRO=ON -DENABLE_WXWIDGETS=OFF -DENABLE_DISCORD_RPC=OFF -DENABLE_CUBEB=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+      - name: Build
+        run: cmake --build build --target cemu_libretro -- -j $(sysctl -n hw.ncpu)
+      - name: Package
+        run: |
+          mkdir -p stage && cp bin/cemu_libretro.dylib stage/
+          (cd stage && zip -q -X ../cemu_libretro_arm64.dylib.zip cemu_libretro.dylib)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: cemu_libretro_arm64.dylib.zip
+
+  publish:
+    name: Publish release
+    needs: [windows, linux, android, macos]
+    if: always() && needs.windows.result == 'success' && (github.event_name == 'push' || github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ls -lh dist
+          cat > notes.md <<'NOTES'
+          Cemu libretro core built for retroXR. Windows x64 always; Linux,
+          Android arm64 and macOS arm64 when they built. The source is this tag.
+          Cemu is MPL-2.0.
+
+          * The TV and the GamePad as two video views, for a frontend that
+            presents them (RETRO_ENVIRONMENT_SET_VIDEO_VIEWS); its own layouts
+            otherwise.
+          * The GamePad's speaker through the controller audio interface.
+          * Wii Remote motion, MotionPlus, the Nunchuk's accelerometer and the IR
+            camera from the frontend; amiibo through its NFC reader.
+          NOTES
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Cemu (retroXR build) $TAG" --notes-file notes.md
+          fi
+          gh release upload "$TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --clobber
