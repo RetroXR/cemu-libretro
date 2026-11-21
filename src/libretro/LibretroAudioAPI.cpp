@@ -140,11 +140,31 @@ void LibretroAudioAPI::FlushAudio(size_t frames)
 	// there at the end of retro_run varied - and its buffer swung between
 	// blocking and running dry without ever settling, where rpcs3's or
 	// xenia's settle within a few thousand frames (NNshi). What is not handed
-	// over stays in the ring for the next run. Only a backlog of more than two
-	// frames goes out on top, so the ring cannot grow without bound.
+	// over stays in the ring for the next run.
+	//
+	// AX makes its audio on the HOST's clock whether retro_run is called or not,
+	// so a backlog is audio from the past: it is DROPPED, never sent on top. A
+	// frontend that paces on its sink (RetroXR's brake waits until the sink is
+	// back to its target) handed a backlog sleeps for as long as that backlog
+	// lasts, during which a backlog as long builds again: after one slow boot
+	// frame it settled at 10 calls a second, the game showing 10 fps, for good.
+	// So exactly one frame a run, and a backlog past four frames is cut back to
+	// two. Not even a little catch-up: sending 1.25 frames a run, the brake let
+	// the core run only 48 times a second (48 x 1.25 = 60 frames' worth).
 	const size_t channels = s_out_channels;
-	const size_t availableSamples = s_ring_buffer.GetReadAvailableSamples();
+	size_t availableSamples = s_ring_buffer.GetReadAvailableSamples();
 	const size_t frameSamples = frames * channels;
+	if (frameSamples > 0 && availableSamples > 4 * frameSamples)
+	{
+		size_t drop = availableSamples - 2 * frameSamples;
+		drop -= drop % channels;
+		s_ring_buffer.Discard(drop);
+		availableSamples -= drop;
+		static uint32_t s_drops = 0;
+		if ((s_drops++ % 60) == 0)
+			cemuLog_log(LogType::Force, "libretro: audio: dropped a stale backlog of {} frames (the frontend called late; {} such drops)",
+				drop / channels, s_drops);
+	}
 	if (availableSamples == 0)
 	{
 		if (s_log_stats)
@@ -157,8 +177,6 @@ void LibretroAudioAPI::FlushAudio(size_t frames)
 	}
 
 	size_t wanted = frameSamples;
-	if (availableSamples > 3 * frameSamples)
-		wanted = availableSamples - 2 * frameSamples;
 	wanted -= wanted % channels;
 	const size_t bufferCap = s_flush_buffer.size();
 	const size_t samplesToRead = std::min({availableSamples, wanted, bufferCap});
